@@ -334,6 +334,9 @@ class StompTransport(CommonTransport):
           transformation:   Transform messages into different format. If set
                             to True, will use 'jms-object-json' formatting.
         """
+        # Callback is ignored - verify that it matches the pre-stored version
+        assert callback is None or callback == self.__subscriptions[sub_id]["callback"]
+
         headers = {}
         if kwargs.get("ignore_namespace"):
             destination = "/topic/" + channel
