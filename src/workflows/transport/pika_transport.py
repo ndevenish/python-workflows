@@ -413,9 +413,9 @@ class PikaTransport(CommonTransport):
         """
         # Callback is stored on an internal property before calling this
         # Validate that it's identical to avoid mismatch errors
-        assert (callback is not None) or callback == self.__subscriptions[sub_id][
-            "callback"
-        ], "Pased callback does not match stored"
+        assert (
+            callback is None or callback == self.__subscriptions[sub_id]["callback"]
+        ), "Pased callback does not match stored"
 
         # Pika callback functions are of the form:
         # channel: pika.channel.Channel
