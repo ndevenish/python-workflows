@@ -15,6 +15,8 @@ import pika
 import workflows
 from workflows.transport.common_transport import CommonTransport, json_serializer
 
+from collections.abc import Hashable, Mapping
+
 logger = logging.getLogger("workflows.transport.pika_transport")
 
 
@@ -390,47 +392,66 @@ class PikaTransport(CommonTransport):
                 prefetch_count=prefetch_count,
             )
 
-    def _subscribe_broadcast(self, consumer_tag, queue, callback, **kwargs):
+    def _subscribe_broadcast(
+        self,
+        sub_id: Hashable,
+        exchange: str,
+        callback: Callable[[Mapping[str, Any], Any], None],
+        **_kwargs,
+    ):
         """Listen to a queue, notify via callback function.
-        :param consumer_tag: ID for this subscription in the transport layer
-        :param queue: Queue name to subscribe to. Queue is bind to exchange
-        :param callback: Function to be called when messages are received
-        :param **kwargs: Further parameters for the transport layer. For example
-          ignore_namespace: Do not apply namespace to the destination name
-          retroactive:      Ask broker to send old messages if possible
-          transformation:   Transform messages into different format. If set
-                            to True, will use 'jms-object-json' formatting.
+
+        Args:
+            sub_id: Internal ID for this subscription
+            exchange: Name of the exchange to bind to
+            callback:
+                Function to be called when message are received. This Is
+                ignored by some transports and so MUST be identical to
+                the internal self.__subcription[sub_id]["callback"]
+                object
+            _kwargs: Unused
         """
+        # Callback is stored on an internal property before calling this
+        # Validate that it's identical to avoid mismatch errors
+        assert (callback is not None) or callback == self.__subscriptions[sub_id][
+            "callback"
+        ], "Pased callback does not match stored"
 
-        headers = {}
+        # Pika callback functions are of the form:
+        # channel: pika.channel.Channel
+        # method: pika.spec.Basic.GetOk
+        # properties: pika.spec.BasicProperties
+        # body: bytes
 
-        def _redirect_callback(ch, method, properties, body):
-            callback(
-                {
-                    "message-id": method.delivery_tag,
-                    "pika-method": method,
-                    "pika-properties": properties,
-                },
-                body,
-            )
+        # headers = {}
 
-        self._reconnection_allowed = False
-        self._channel.basic_qos(prefetch_count=1)
-        self._channel.basic_consume(
-            queue=queue,
-            on_message_callback=_redirect_callback,
-            auto_ack=True,
-            consumer_tag=str(consumer_tag),
-            arguments=headers,
-        )
-        try:
-            self._channel.start_consuming()
-        except pika.exceptions.AMQPChannelError:
-            self.disconnect()
-            raise workflows.Disconnected("Caught a channel error")
-        except pika.exceptions.AMQPConnectionError:
-            self.disconnect()
-            raise workflows.Disconnected("Connection to RabbitMQ server was closed.")
+        # def _redirect_callback(ch, method, properties, body):
+        #     callback(
+        #         {
+        #             "message-id": method.delivery_tag,
+        #             "pika-method": method,
+        #             "pika-properties": properties,
+        #         },
+        #         body,
+        #     )
+
+        # self._reconnection_allowed = False
+        # self._channel.basic_qos(prefetch_count=1)
+        # self._channel.basic_consume(
+        #     queue=queue,
+        #     on_message_callback=_redirect_callback,
+        #     auto_ack=True,
+        #     consumer_tag=str(consumer_tag),
+        #     arguments=headers,
+        # )
+        # try:
+        #     self._channel.start_consuming()
+        # except pika.exceptions.AMQPChannelError:
+        #     self.disconnect()
+        #     raise workflows.Disconnected("Caught a channel error")
+        # except pika.exceptions.AMQPConnectionError:
+        #     self.disconnect()
+        #     raise workflows.Disconnected("Connection to RabbitMQ server was closed.")
 
     def _unsubscribe(self, consumer_tag):
         """Stop listening to a queue
