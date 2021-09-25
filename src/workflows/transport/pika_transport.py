@@ -688,7 +688,7 @@ class _PikaSubscription:
     kind: _PikaSubscriptionKind
     on_message_callback: PikaCallback = dataclasses.field(repr=False)
     prefetch_count: int
-    queue: str = dataclasses.field(init=False)
+    queue: str = dataclasses.field(init=False, default=None)
     reconnectable: bool
 
 
@@ -746,7 +746,7 @@ class _PikaThread(threading.Thread):
         """Read the current connection state"""
         return self._state
 
-    def start(self):
+    def start(self, *, wait_for_connection=True):
         """Spawn the thread. Can Only call once per instance. Thread-safe."""
 
         # Ensure we can never accidentally call this twice
@@ -762,6 +762,9 @@ class _PikaThread(threading.Thread):
             return
 
         super().start()
+
+        if wait_for_connection:
+            self.wait_for_connection()
 
     def stop(self):
         """
@@ -782,8 +785,12 @@ class _PikaThread(threading.Thread):
             )
 
         self._please_stop.set()
-        # We might be waiting for an event, so give the event loop one
-        self._connection.add_callback_threadsafe(lambda: None)
+        # We might be waiting for an event, so give the event loop one...
+        # We might already be closed or shutting down, so ignore errors for that
+        try:
+            self._connection.add_callback_threadsafe(lambda: None)
+        except pika.exceptions.ConnectionWrongStateError:
+            pass
 
     def join(
         self, timeout: Optional[float] = None, *, re_raise: bool = False, stop=False
@@ -825,11 +832,11 @@ class _PikaThread(threading.Thread):
 
     def subscribe_queue(
         self,
-        consumer_tag: int,
         queue: str,
         callback: PikaCallback,
         *,
         auto_ack: bool = True,
+        consumer_tag: Optional[int] = None,
         exclusive: bool = False,
         prefetch_count: int = 1,
         reconnectable: bool = False,
@@ -871,11 +878,11 @@ class _PikaThread(threading.Thread):
 
     def subscribe_broadcast(
         self,
-        consumer_tag: int,
         exchange: str,
         callback: PikaCallback,
         *,
         auto_ack: bool = True,
+        consumer_tag: Optional[int] = None,
         reconnectable: bool = False,
         prefetch_count: int = 0,
     ) -> concurrent.futures.Future:
@@ -883,10 +890,10 @@ class _PikaThread(threading.Thread):
         Subscribe to a broadcast exchange. Thread-safe.
 
         Args:
-            consumer_tag: Internal ID representing this subscription
             exchange: The queue to listen for messages on
             callback: The function to call when receiving messages on this queue
             auto_ack: Should this subscription auto-acknowledge messages?
+            consumer_tag: Internal ID representing this subscription. Generated if unspecified.
             prefetch_count: How many messages are we allowed to prefetch
             reconnectable: Are we allowed to reconnect to this subscription
 
@@ -917,7 +924,7 @@ class _PikaThread(threading.Thread):
 
     def _synchronize_subscriptions(self):
         """Synchronize subscriptions list with the current connection."""
-        assert self._state == _PikaThreadStatus.CONNECTED
+        # assert self._state == _PikaThreadStatus.CONNECTED
 
         for consumer_tag, subscription in self._subscriptions.items():
             # If we have a channel, then we've already handled
@@ -925,9 +932,11 @@ class _PikaThread(threading.Thread):
                 continue
 
             # We flip reconnection to False if any subscription is not reconnectable
-            self._reconnection_allowed = (
-                self._reconnection_allowed and subscription.reconnectable
-            )
+            if self._reconnection_allowed and not subscription.reconnectable:
+                self._reconnection_allowed = False
+                logger.debug(
+                    f"Subscription {consumer_tag} to '{subscription.destination}' is not reconnectable. Turning reconnection off."
+                )
 
             # Either open a channel (if prefetch) or use the shared one
             if subscription.prefetch_count == 0:
@@ -954,34 +963,52 @@ class _PikaThread(threading.Thread):
                 subscription.on_message_callback,
                 auto_ack=subscription.auto_ack,
                 exclusive=subscription.exclusive,
-                consumer_tag=consumer_tag,
+                consumer_tag=str(consumer_tag),
             )
             logger.debug("Consuming (%d) on %s", consumer_tag, subscription.queue)
 
             # Record the consumer channel
             self._pika_channels[consumer_tag] = channel
+        logger.debug(
+            f"Subscriptions synchronized. Reconnections allowed? - {'Yes' if self._reconnection_allowed else 'No.'}"
+        )
 
     def _run(self):
         assert self._state == _PikaThreadStatus.NEW
         assert self._reconnection_allowed, "Should be true until first synchronize"
         logger.debug("pika thread starting")
+        connection_counter = 0
 
         # Loop until we either can't, or are asked not to
-        while not self._please_stop.is_set() and self._reconnection_allowed:
+        while (
+            connection_counter == 0 or self._reconnection_allowed
+        ) and not self._please_stop.is_set():
             try:
+                if connection_counter == 0:
+                    logger.debug("Connecting to AMPQ")
+                else:
+                    logger.debug(f"Reconnecting to AMPQ #{connection_counter}")
                 self._state = _PikaThreadStatus.CONNECTING
 
                 # Make sure we don't always connect to the same server first
                 random.shuffle(self._connection_parameters)
                 self._connection = pika.BlockingConnection(self._connection_parameters)
-                self._state = _PikaThreadStatus.CONNECTED
-                self._connected.set()
+                logger.debug(f"Connection #{connection_counter} connected")
+                connection_counter += 1
+
                 # Clear the channels because this might be a reconnect
                 self._pika_channels = {}
                 self._pika_shared_channel = None
 
                 # [Re]create subscriptions
+                logger.debug("Setting up subscriptions")
                 self._synchronize_subscriptions()
+                # We set up here because we don't want to class as CONNECTED
+                # until all requested subscriptions have been actioned.
+                self._state = _PikaThreadStatus.CONNECTED
+                self._connected.set()
+
+                logger.debug("Waiting for events")
 
                 # Run until we are asked to stop, or fail
                 while not self._please_stop.is_set():
@@ -990,40 +1017,60 @@ class _PikaThread(threading.Thread):
                 # We failed to even connect the first time - in this case fail visibly
                 logger.error("Failed to connect to pika server")
                 break
-            except (
-                pika.exceptions.ConnectionClosed,
-                pika.exceptions.ChannelClosed,
-            ) as e:
+            except pika.exceptions.ConnectionClosed:
                 if self._please_stop.is_set():
                     logger.info("Connection closed on request")
-                else:
-                    logger.error("Connection closed unexpectedly or by broken channel")
                     self._exc_info = sys.exc_info()
-                    self._please_stop.set()
+                else:
+                    logger.error("Connection closed unexpectedly")
+                    self._exc_info = sys.exc_info()
+            except pika.exceptions.ChannelClosed as e:
+                logger.error("Channel closed: {e}")
+                self._exc_info = sys.exc_info()
+            except pika.exceptions.ConnectionWrongStateError as e:
+                logger.debug(
+                    "Got ConnectionWrongStateError - connection closed by other means?"
+                )
+                self._exc_info = sys.exc_info()
             except BaseException as e:
-                logger.error(f"Connection failed for unknown reason: {e}")
+                logger.error(f"Connection failed for unknown reason: {e!r}")
                 self._exc_info = sys.exc_info()
                 break
+            # Make sure our connection is closed before reconnecting
+            if not self._connection.is_closed:
+                logger.info("Connection not closed. Closing.")
+                self._connection.close()
 
+        logger.debug(f"Shutting down thread. Requested? {self._please_stop.is_set()}")
         # We're shutting down. Do this cleanly.
         self._state = _PikaThreadStatus.STOPPING
+
+        # Make sure the connection is closed
+        if not self._connection.is_closed:
+            self._connection.close()
+
         self._state = _PikaThreadStatus.STOPPED
         self._please_stop.set()
 
         # We might not have successfully connected - but we might be waiting
         # on a connection somewhere. So now we've actually marked ourselves
-        # as disconnected, mark
+        # as disconnected, mark this.
+        #
+        # Note: Probably the wrong way to do this. Make more elaborate later.
         self._connected.set()
 
     def _add_subscription_in_thread(
         self,
-        consumer_tag: int,
+        consumer_tag: Optional[int],
         subscription: _PikaSubscription,
         result: concurrent.futures.Future,
     ):
         """Add a subscription to the pika connection, on the connection thread."""
         try:
             if result.set_running_or_notify_cancel():
+                # If not specified, generate a consumer_tag automatically
+                if consumer_tag is None:
+                    consumer_tag = min([-5000] + list(self._subscriptions.values())) - 1
                 assert (
                     consumer_tag not in self._subscriptions
                 ), f"Subscription request {consumer_tag} rejected due to existing subscription {self._subscriptions[consumer_tag]}"
